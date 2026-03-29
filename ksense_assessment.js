@@ -1,28 +1,25 @@
+/**
+ * KSense Healthcare API Assessment
+ * ----------------------------------
+ * Author: Meghana Divve
+ * Date: March 2026
+ *
+ * Solution Overview:
+ * - Fetches all patients from the paginated DemoMed Healthcare API
+ * - Handles real-world API issues: rate limiting, intermittent failures, inconsistent data
+ * - Scores each patient across 3 risk categories: Blood Pressure, Temperature, Age
+ * - Builds 3 alert lists: High-Risk, Fever, and Data Quality Issues
+ * - Submits results to the assessment API
+ */
 
-//   KSense Healthcare API Assessment
-//   ----------------------------------
-//   Author: Meghana Divve
-//   Date: March 2026
- 
-//   Solution Overview:
-//   - Fetches all patients from the paginated DemoMed Healthcare API
-//   - Handles real-world API issues: rate limiting, intermittent failures, inconsistent data
-//   - Scores each patient across 3 risk categories: Blood Pressure, Temperature, Age
-//   - Builds 3 alert lists: High-Risk, Fever, and Data Quality Issues
-//   - Submits results to the assessment API
- 
-
-const API_KEY = "ak_776236ff7ad056ca820cbda30e6ba1db8bb9474e239cc0c0";
+// Replace with your API key from the assessment page
+const API_KEY = process.env.API_KEY || "YOUR_API_KEY_HERE";
 const BASE_URL = "https://assessment.ksensetech.com/api";
-
-//  Sleep helper for delays
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-
 // Fetch with exponential backoff retry
 // Handles: 429 (rate limit), 500/503 (server errors), network failures
-
 async function fetchWithRetry(url, options = {}, maxRetries = 5) {
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
@@ -58,10 +55,9 @@ async function fetchWithRetry(url, options = {}, maxRetries = 5) {
   return null;
 }
 
-// ------------------------------------------------------------------------------------
-// STEP 1: Fetch all patients (handles pagination automatically)
-// Uses limit=20 for efficiency instead of the default 5
-// ------------------------------------------------------------------------------------
+// Fetch all patients across all pages
+// Uses limit=20 for efficiency. Does NOT rely on hasNext as the API
+// sometimes returns it incorrectly — stops when total is reached or page is empty.
 async function fetchAllPatients() {
   const allPatients = [];
   let page = 1;
@@ -83,31 +79,28 @@ async function fetchAllPatients() {
     allPatients.push(...patients);
     console.log(`  Got ${patients.length} patients (total: ${allPatients.length})`);
 
-    if (!data.pagination?.hasNext) break;
+    const total = data.pagination?.total;
+    if (total && allPatients.length >= total) break;
+    if (patients.length < 20) break;
 
     page++;
-    await sleep(300); 
+    await sleep(300);
   }
 
   return allPatients;
 }
 
-// ------------------------------------------------------------------------------------
-// STEP 2: Risk Scoring Functions
-// ------------------------------------------------------------------------------------
-
-// 
-//  -Blood Pressure Risk Scoring
-//  -Expected format: "120/80" (systolic/diastolic)
-//  -Rule: If systolic and diastolic fall in different stages, use the HIGHER stage
-//-----------------------------------------------------------------
-//  -Normal   (Systolic <120 AND Diastolic <80):     0 pts
-//  -Elevated (Systolic 120-129 AND Diastolic <80):  1 pt
-//  -Stage 1  (Systolic 130-139 OR Diastolic 80-89): 2 pts
-//  -Stage 2  (Systolic >=140  OR Diastolic >=90):   3 pts
-//  -Invalid  (missing/malformed):                   0 pts + flag
-
-
+/**
+ * Blood Pressure Risk Scoring
+ * Expected format: "120/80" (systolic/diastolic)
+ * Rule: If systolic and diastolic fall in different stages, use the HIGHER stage
+ *
+ * Normal   (Systolic <120 AND Diastolic <80):     0 pts
+ * Elevated (Systolic 120-129 AND Diastolic <80):  1 pt
+ * Stage 1  (Systolic 130-139 OR Diastolic 80-89): 2 pts
+ * Stage 2  (Systolic >=140  OR Diastolic >=90):   3 pts
+ * Invalid  (missing/malformed):                   0 pts + flag
+ */
 function scoreBloodPressure(bp) {
   if (!bp || typeof bp !== "string" || !bp.includes("/")) {
     return { score: 0, invalid: true };
@@ -119,7 +112,6 @@ function scoreBloodPressure(bp) {
   const systolic = parseFloat(parts[0].trim());
   const diastolic = parseFloat(parts[1].trim());
 
-  // Reject non-numeric values ["INVALID", "N/A", "150/" or "/90"]
   if (isNaN(systolic) || isNaN(diastolic)) return { score: 0, invalid: true };
 
   let sysScore;
@@ -137,22 +129,22 @@ function scoreBloodPressure(bp) {
   return { score: Math.max(sysScore, diasScore), invalid: false };
 }
 
-
-//  Temperature Risk Scoring
-//  Expected format: numeric value in degrees F
- 
-//  Normal    (<=99.5 F):       0 pts
-//  Low Fever (99.6-100.9 F):   1 pt
-//  High Fever (>=101.0 F):     2 pts
-//  Invalid   (non-numeric strings, null, empty): 0 pts + flag
-//   hasFever = true if temp >= 99.6 F (used for fever alert list)
- 
+/**
+ * Temperature Risk Scoring
+ * Expected format: numeric value in degrees F
+ *
+ * Normal    (<=99.5 F):       0 pts
+ * Low Fever (99.6-100.9 F):   1 pt
+ * High Fever (>=101.0 F):     2 pts
+ * Invalid   (non-numeric strings, null, empty): 0 pts + flag
+ *
+ * hasFever = true if temp >= 99.6 F (used for fever alert list)
+ */
 function scoreTemperature(temp) {
   if (temp === null || temp === undefined || temp === "") {
     return { score: 0, invalid: true, hasFever: false };
   }
 
- 
   if (typeof temp === "string") {
     const parsed = parseFloat(temp);
     if (isNaN(parsed)) return { score: 0, invalid: true, hasFever: false };
@@ -170,21 +162,20 @@ function scoreTemperature(temp) {
   return { score: 2, invalid: false, hasFever };
 }
 
-
-//  Age Risk Scoring
-//   Expected format: numeric value (years)
- 
-//  Under 40 (<40):   0 pts
-//  Middle  (40-65):  1 pt
-//   Senior  (>65):    2 pts
-//  Invalid (non-numeric strings like "fifty-three", null, empty): 0 pts + flag
- 
+/**
+ * Age Risk Scoring
+ * Expected format: numeric value (years)
+ *
+ * Under 40 (<40):   0 pts
+ * Middle  (40-65):  1 pt
+ * Senior  (>65):    2 pts
+ * Invalid (non-numeric strings like "fifty-three", null, empty): 0 pts + flag
+ */
 function scoreAge(age) {
   if (age === null || age === undefined || age === "") {
     return { score: 0, invalid: true };
   }
 
-  // Reject words like "fifty-three", "unknown"
   if (typeof age === "string") {
     const parsed = parseFloat(age);
     if (isNaN(parsed)) return { score: 0, invalid: true };
@@ -198,13 +189,10 @@ function scoreAge(age) {
   return { score: 2, invalid: false };
 }
 
-// -------------------------------------------------------------
-// STEP 3: Process all patients and build alert lists
-// ------------------------------------------------------------
 function processPatients(patients) {
-  const highRiskPatients = [];   
-  const feverPatients = [];      
-  const dataQualityIssues = [];  
+  const highRiskPatients = [];
+  const feverPatients = [];
+  const dataQualityIssues = [];
 
   console.log("\nScoring patients...\n");
 
@@ -238,9 +226,6 @@ function processPatients(patients) {
   return { highRiskPatients, feverPatients, dataQualityIssues };
 }
 
-
-// STEP 4: Print summary report
-
 function printSummary(patients, highRiskPatients, feverPatients, dataQualityIssues) {
   console.log("\n" + "=".repeat(60));
   console.log("SUMMARY REPORT");
@@ -255,9 +240,6 @@ function printSummary(patients, highRiskPatients, feverPatients, dataQualityIssu
   console.log(`Data Issue IDs : ${dataQualityIssues.join(", ")}`);
   console.log("=".repeat(60) + "\n");
 }
-
-
-// STEP 5: Submit results to the assessment API
 
 async function submitResults(results) {
   console.log("Submitting results...\n");
@@ -301,8 +283,6 @@ async function submitResults(results) {
 
   console.log("\n" + "=".repeat(60));
 }
-
- // MAIN
 
 async function main() {
   console.log("=".repeat(60));
